@@ -1,0 +1,4 @@
+*.ipynb
+*.m
+.ipynb_checkpoints/
+logs/
