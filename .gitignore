@@ -2,3 +2,4 @@
 *.m
 .ipynb_checkpoints/
 logs/
+notebooks/

@@ -1,166 +1,220 @@
+from typing import Optional
 import numpy as np
 import os
 import pickle
 from scipy.io import loadmat
 import matplotlib.pyplot as plt
 
-usePeriodicNetwork = False # True
-useRealTraj = True
-constantVel = np.array([0., 0.])
+from tqdm import trange
 
-# network parameters
-tau = 10 # time constant (ms)
-if useRealTraj:
-    alpha = 50.
-else:
-    alpha = 0.10315 # parameter used in the original paper
-    
-n = 128
-ncells = 128 * 128
-a = 1
-lmd = 13
-beta = 3 / (lmd ** 2)
-gamma = 1.1 * beta # 1.05 * beta in the original paper
 
-spikeThreshold = 0.1
-
-dt = 0.5 # integration time step (ms)
-simdur = 100 * 1e3
-stabilisationTime = 100 # no-velocity time for pattern to form (ms)
-tind = 0
-t = 0
-
-s = np.random.random((1, ncells))
-
-watchCell = int(ncells/2) - int(n/2)
-nSpatialBins = 60
-minx, maxx = -0.9, 0.9
-miny, maxy = -0.9, 0.9
-occupancy = np.zeros((nSpatialBins, nSpatialBins))
-spikes = np.zeros((nSpatialBins, nSpatialBins))
-spikeCoords = []
-
-# create 2 x ncells matrix of the 2d cell preferred direction vector (radians)
-dirs = np.array([[0, np.pi/2],
-                 [np.pi, 3*np.pi/2]])
-dirs = np.tile(dirs, [int(n/2), int(n/2)]).reshape(1, -1)
-dirVecs = np.concatenate([np.cos(dirs), np.sin(dirs)], axis=0)
-
-# create 2 x ncells matrix of 2d cell positions on the neural sheet
-# x = np.linspace(-int(n/2), int(n/2), n)
-x = np.arange(n) - (n-1) / 2
-X, Y = np.meshgrid(x, x)
-x = np.concatenate([X.reshape(1, -1), Y.reshape(1, -1)], axis=0)
-cellDists = np.sqrt(np.sum(np.square(x), axis=0))
-cellSpacing = Y[1, 0] - Y[0, 0]
-ell = 2 * cellSpacing
-
-wSparseThreshold = -1e-6
-
-identifier = ('periodic' if usePeriodicNetwork else 'aperiodic') + '_' + f'ell_{ell}'
-if os.path.exists(f'logs/burak_fiete_2009_W_{identifier}.pkl'):
-    with open(f'logs/burak_fiete_2009_W_{identifier}.pkl', 'rb') as fi:
-        W = pickle.load(fi)
-    print('loaded pre-generated W.')
-else:
-    print('generating new W')
-    W = np.zeros((ncells, ncells))
-    for i in range(ncells):
-        if (i+1) % int(ncells/10) == 0:
-            print(f'generating weight matrix, {int((i+1)/ncells*100)}% done')
-        if usePeriodicNetwork:
-            squaredShiftLengths = np.zeros((9, ncells))
-            shifts = np.tile(x[:, [i]], [1, ncells]) - x - ell * dirVecs
-            squaredShiftLengths[0, :] = np.sum(np.square(shifts), axis=0)
-            shifts = np.tile(x[:, [i]], [1, ncells]) - x - n * np.concatenate([np.ones((1, ncells)), np.zeros((1, ncells))], axis=0) - ell * dirVecs
-            squaredShiftLengths[1, :] = np.sum(np.square(shifts), axis=0)
-            shifts = np.tile(x[:, [i]], [1, ncells]) - x + n * np.concatenate([np.ones((1, ncells)), np.zeros((1, ncells))], axis=0) - ell * dirVecs
-            squaredShiftLengths[2, :] = np.sum(np.square(shifts), axis=0)
-            shifts = np.tile(x[:, [i]], [1, ncells]) - x - n * np.concatenate([np.zeros((1, ncells)), np.ones((1, ncells))], axis=0) - ell * dirVecs
-            squaredShiftLengths[3, :] = np.sum(np.square(shifts), axis=0)
-            shifts = np.tile(x[:, [i]], [1, ncells]) - x + n * np.concatenate([np.zeros((1, ncells)), np.ones((1, ncells))], axis=0) - ell * dirVecs
-            squaredShiftLengths[4, :] = np.sum(np.square(shifts), axis=0)
-            shifts = np.tile(x[:, [i]], [1, ncells]) - x + n * np.concatenate([np.ones((1, ncells)), np.ones((1, ncells))], axis=0) - ell * dirVecs
-            squaredShiftLengths[5, :] = np.sum(np.square(shifts), axis=0)
-            shifts = np.tile(x[:, [i]], [1, ncells]) - x + n * np.concatenate([-1 * np.ones((1, ncells)), np.ones((1, ncells))], axis=0) - ell * dirVecs
-            squaredShiftLengths[6, :] = np.sum(np.square(shifts), axis=0)
-            shifts = np.tile(x[:, [i]], [1, ncells]) - x + n * np.concatenate([np.ones((1, ncells)), -1 * np.ones((1, ncells))], axis=0) - ell * dirVecs
-            squaredShiftLengths[7, :] = np.sum(np.square(shifts), axis=0)
-            shifts = np.tile(x[:, [i]], [1, ncells]) - x + n * np.concatenate([-1 * np.ones((1, ncells)), -1 * np.ones((1, ncells))], axis=0) - ell * dirVecs
-            squaredShiftLengths[8, :] = np.sum(np.square(shifts), axis=0)
-            
-            squaredShiftLengths = np.min(squaredShiftLengths, axis=0)
+class BurakFiete2009:
+    def __init__(
+        self, 
+        tau: float = 10, # time constant
+        alpha: float = 50., # multiplicative scalar factor coupling rat velocity to network dynamics
+        a: float = 1., # scaling factor for the center-surround weight distribution
+        side_len: int = 128, # number of discretised bins on each side of the square enclosure (neural sheet)
+        lmd: int = 13, # approximate periodicity of the formed lattice in the neural sheet
+        gamma_scaling: float = 1.1, # scaling factor between gamma and beta, 1.05 is used in the original paper
+        spike_threshold: float = 0.1, # integrate-and-fire threshold
+        dt: float = 0.5, # integration time step
+        duration: float = 1e5, # simulation duration
+        stabilisation_time: float = 100, # no-velocity time for pattern formation
+        periodic: bool = False, # using periodic boundary conditions in the neural sheet
+        use_real_traj: bool = True, # using real trajectrory
+        num_spatial_bins: int = 60, # number of spatial bins
+        w_sparse_threshold: float = -1e-6, 
+    ):
+        self.tau = tau
+        self.alpha = alpha
+        self.a = a
         
+        self.side_len = side_len
+        self.num_neurons = side_len * side_len
+        
+        self.lmd = lmd
+        self.beta = 3 / (lmd ** 2)
+        self.gamma = gamma_scaling * self.beta
+        
+        self.spike_threshold = spike_threshold
+        self.dt = dt
+        self.duration = duration
+        self.stabilisation_time = stabilisation_time
+        
+        self.periodic = periodic
+        self.use_real_traj = use_real_traj
+        
+        self.watch_cell = self.num_neurons // 2 - self.side_len // 2
+        
+        self.num_spatial_bins = num_spatial_bins
+        self.x_min = -0.9
+        self.x_max = 0.9
+        self.y_min = -0.9
+        self.y_max = 0.9
+        
+        directions = np.array([
+            [0, np.pi / 2], 
+            [np.pi, 3 * np.pi / 2],
+        ])
+        self.directions = np.tile(directions, [self.side_len // 2, self.side_len // 2]).reshape(1, -1)
+        self.direction_vecs = np.concatenate([np.cos(self.directions), np.sin(self.directions)], axis=0)
+        
+        self.construct_neural_sheet()
+        
+        self.w_sparse_threshold = w_sparse_threshold # sparsity constraint in constructing weight matrix
+        self.W = self.construct_weight_matrix()
+        self.A = self.construct_envelope()
+    
+    def construct_neural_sheet(self):
+        x = np.arange(self.side_len) - (self.side_len - 1) / 2
+        X, Y = np.meshgrid(x, x)
+        self.neural_sheet = np.concatenate([X.reshape(1, -1), Y.reshape(1, -1)], axis=0)
+        self.cell_distance = np.sqrt(np.sum(np.square (self.neural_sheet), axis=0))
+        self.cell_spacing = Y[1, 0] - Y[0, 0] # length of field shift in recurrent connections
+        self.ell = 2 * self.cell_spacing # offset of center of inhibitory output
+        
+    def construct_weight_matrix(self):
+        identifier = "burak_fiete_2009_W_" + ("periodic" if self.periodic else "aperiodic") + \
+            f"N_{self.num_neurons}_ell_{self.ell}"
+        
+        if os.path.exists(f"logs/{identifier}.pkl"):
+            with open(f"logs/{identifier}.pkl", "rb") as f:
+                W = pickle.load(f)
+            f.close()
+
+            print("Cached W matrix loaded!")
         else:
-            shifts = np.tile(x[:, [i]], [1, ncells]) - x - ell*dirVecs
-            squaredShiftLengths = np.sum(np.square(shifts), axis=0)
+            print("Generating weight matrix")
+            
+            W = np.zeros((self.num_neurons, self.num_neurons))
+            with trange(self.num_neurons, dynamic_ncols=True) as pbar:
+                for i in pbar:
+                    if self.periodic:
+                        squared_shift_length = np.zeros((9, self.num_neurons))
+                        shifts = np.tile(self.neural_sheet[:, [i]], [1, self.num_neurons]) - self.neural_sheet - self.ell * self.direction_vecs
+                        squared_shift_length[0, :] = np.sum(np.square(shifts), axis=0)
+                        shifts = np.tile(self.neural_sheet[:, [i]], [1, self.num_neurons]) - self.neural_sheet - self.ell * self.direction_vecs - self.side_len * np.concatenate([np.ones((1, self.num_neurons)), np.zeros((1, self.num_neurons))], axis=0)
+                        squared_shift_length[1, :] = np.sum(np.square(shifts), axis=0)
+                        shifts = np.tile(self.neural_sheet[:, [i]], [1, self.num_neurons]) - self.neural_sheet - self.ell * self.direction_vecs + self.side_len * np.concatenate([np.ones((1, self.num_neurons)), np.zeros((1, self.num_neurons))], axis=0)
+                        squared_shift_length[2, :] = np.sum(np.square(shifts), axis=0)
+                        shifts = np.tile(self.neural_sheet[:, [i]], [1, self.num_neurons]) - self.neural_sheet - self.ell * self.direction_vecs - self.side_len * np.concatenate([np.zeros((1, self.num_neurons)), np.ones((1, self.num_neurons))], axis=0)
+                        squared_shift_length[3, :] = np.sum(np.square(shifts), axis=0)
+                        shifts = np.tile(self.neural_sheet[:, [i]], [1, self.num_neurons]) - self.neural_sheet - self.ell * self.direction_vecs + self.side_len * np.concatenate([np.zeros((1, self.num_neurons)), np.ones((1, self.num_neurons))], axis=0)
+                        squared_shift_length[4, :] = np.sum(np.square(shifts), axis=0)
+                        shifts = np.tile(self.neural_sheet[:, [i]], [1, self.num_neurons]) - self.neural_sheet - self.ell * self.direction_vecs + self.side_len * np.concatenate([np.ones((1, self.num_neurons)), np.ones((1, self.num_neurons))], axis=0)
+                        squared_shift_length[5, :] = np.sum(np.square(shifts), axis=0)
+                        shifts = np.tile(self.neural_sheet[:, [i]], [1, self.num_neurons]) - self.neural_sheet - self.ell * self.direction_vecs + self.side_len * np.concatenate([-1 * np.ones((1, self.num_neurons)), np.ones((1, self.num_neurons))], axis=0)
+                        squared_shift_length[6, :] = np.sum(np.square(shifts), axis=0)
+                        shifts = np.tile(self.neural_sheet[:, [i]], [1, self.num_neurons]) - self.neural_sheet - self.ell * self.direction_vecs + self.side_len * np.concatenate([np.ones((1, self.num_neurons)), -1 * np.ones((1, self.num_neurons))], axis=0)
+                        squared_shift_length[7, :] = np.sum(np.square(shifts), axis=0)
+                        shifts = np.tile(self.neural_sheet[:, [i]], [1, self.num_neurons]) - self.neural_sheet - self.ell * self.direction_vecs - self.side_len * np.concatenate([np.ones((1, self.num_neurons)), np.ones((1, self.num_neurons))], axis=0)
+                        squared_shift_length[8, :] = np.sum(np.square(shifts), axis=0)
+                        
+                        squared_shift_length = np.min(squared_shift_length, axis=0)
+                    else:
+                        shifts = np.tile(self.neural_sheet[:, [i]], [1, self.num_neurons]) - self.neural_sheet - self.ell * self.direction_vecs
+                        squared_shift_length = np.sum(np.square(shifts), axis=0)
+
+                    w_temp = self.a * np.exp(-self.gamma * squared_shift_length) - np.exp(-self.beta * squared_shift_length)
+                    w_temp[w_temp > self.w_sparse_threshold] = 0
+                    
+                    W[i, :] = w_temp
+            
+            with open(f"logs/{identifier}.pkl", "wb") as f:
+                pickle.dump(W, f)                    
+            f.close()
         
-        temp = a * np.exp(-gamma * squaredShiftLengths) - np.exp(-beta * squaredShiftLengths)
+        return W
+    
+    def construct_envelope(self):
+        if self.periodic:
+            A = np.ones_like(self.cell_distance)
+        else:
+            R = self.side_len / 2
+            a0 = self.side_len / 32
+            dr = self.side_len / 2
+            A = np.exp(-a0 * np.square((self.cell_distance - R + dr)/dr))
+            A[self.cell_distance < dr] = 1.
         
-        temp[temp > wSparseThreshold] = 0
+        return A
+    
+    def load_real_traj(self, logdir: str):
+        assert os.path.exists(logdir)
         
-        W[i, :] = temp
+        pos = loadmat(logdir)["pos"]
+        pos[2, :] = pos[2, :] * 1000 # s -> ms
+        
+        pos = np.concatenate([
+            np.interp(np.arange(0, pos[2, -1] + 1), pos[2, :], pos[0, :]).reshape(1, -1),
+            np.interp(np.arange(0, pos[2, -1] + 1), pos[2, :], pos[1, :]).reshape(1, -1),
+            np.interp(np.arange(0, pos[2, -1] + 1), pos[2, :], pos[2, :]).reshape(1, -1),
+        ], axis=0)
+        
+        pos[:2] /= 100 # cm -> m
+        
+        velocity = np.concatenate([
+            (pos[0, 1:] - pos[0, :-1]).reshape(1, -1), 
+            (pos[1, 1:] - pos[1, :-1]).reshape(1, -1), 
+        ], axis=0) / self.dt
+        
+        return pos, velocity
     
-    with open(f'logs/burak_fiete_2009_W_{identifier}.pkl', 'wb') as fi:
-        pickle.dump(W, fi)
+    def simulation(self, logdir: Optional[str] = None):
+        if self.use_real_traj:
+            assert logdir is not None
+            
+            pos, velocity = self.load_real_traj(logdir)
+            
+            simulation_length = int(self.duration / self.dt)
+            
+            speed = np.zeros((simulation_length, ))
+            curr_direction = np.zeros((simulation_length, ))
+            occupancy = np.zeros((self.num_spatial_bins, self.num_spatial_bins))
+            spikes = np.zeros((self.num_spatial_bins, self.num_spatial_bins))
+            spike_coordinates = []
+            
+            t = 0
+            s = np.random.random((self.num_neurons, ))
+            with trange(simulation_length, dynamic_ncols=True) as pbar:
+                for i in pbar:
+                    t = i * self.dt
 
-# define envelope function
-if usePeriodicNetwork:
-    A = np.ones_like(cellDists)
-else:
-    R = n / 2
-    a0 = n / 32
-    dr = n / 2 # diameter of non-tapered region
-    A = np.exp(-a0 * ((cellDists-R + dr)/dr)**2)
-    A[cellDists < (R-dr)] = 1
+                    if t < self.stabilisation_time:
+                        v = np.zeros((2, ))
+                    else:
+                        v = velocity[:, i]
+                    
+                    curr_direction[i] = np.arctan2(v[1], v[0])
+                    speed[i] = np.sqrt(v[0] ** 2 + v[1] ** 2)
+                    
+                    # feedforward input
+                    B = self.A * (1 + self.alpha * np.dot(v, self.direction_vecs))
+                    
+                    s_inputs = self.W.dot(s) + B
+                    s_inputs = s_inputs * (s_inputs > 0)
+                    
+                    s = s + self.dt * (s_inputs - s) / self.tau
+                    
+                    if s[self.watch_cell] > self.spike_threshold:
+                        spike_coordinates.append([pos[0, i], pos[1, i]])
+                        x_ind = int((pos[0, i] - self.x_min) / (self.x_max - self.x_min) * self.num_spatial_bins)
+                        y_ind = int((pos[1, i] - self.y_min) / (self.y_max - self.y_min) * self.num_spatial_bins) 
+                        
+                        occupancy[y_ind, x_ind] += self.dt
+                        spikes[y_ind, x_ind] += s[self.watch_cell]
+                    
+                    pbar.set_description(f"t = {t}ms / {self.duration}ms")
+        else:
+            raise NotImplementedError
 
-pos = loadmat('data/HaftingTraj_centimeters_seconds.mat')['pos']
-pos[2, :] = pos[2, :] * 1000 # s to ms
+        return spike_coordinates, occupancy, spikes
 
-pos = np.concatenate([np.interp(np.arange(0, pos[2, -1]+1), pos[2, :], pos[0, :]).reshape(1, -1), 
-                      np.interp(np.arange(0, pos[2, -1]+1), pos[2, :], pos[1, :]).reshape(1, -1), 
-                      np.interp(np.arange(0, pos[2, -1]+1), pos[2, :], pos[2, :]).reshape(1, -1)], 
-                     axis=0)
-pos[:2] = pos[:2] / 100 # cm to m
-vels = np.concatenate([(pos[0, 1:]-pos[0, :-1]).reshape(1, -1), 
-                       (pos[1, 1:]-pos[1, :-1]).reshape(1, -1)], 
-                      axis=0) / dt
 
-x, y = pos[0, 0], pos[1, 0]
-
-speed = np.zeros((1, int(simdur / dt)))
-curDir = np.zeros((1, int(simdur / dt)))
-vhist = np.zeros((1, int(simdur / dt)))
-fhist = np.zeros((1, int(simdur / dt)))
-spikeCoords = []
-
-while t < simdur:
-    tind += 1
-    t = dt * tind
+if __name__=="__main__":
+    traj_logdir = "data/HaftingTraj_centimeters_seconds.mat"
+    bf_can = BurakFiete2009()
     
-    if t < stabilisationTime:
-        v = np.array([0., 0.])
-    else:
-        v = vels[:, tind]
+    # takes about 1 hour to run the simulation over 20mins recording!
+    spike_coordinates, occupancy, spikes = bf_can.simulation(traj_logdir)
     
-    curDir[0, tind] = np.arctan2(v[1], v[0])
-    speed[0, tind] = np.sqrt(v[0]**2 + v[1]**2)
-    
-    # feedforard input
-    B = A * (1 + alpha*(dirVecs.T.dot(v)).T)
-    
-    sInputs = (W.dot(s.T)).T + B
-    sInputs = sInputs * (sInputs > 0)
-    
-    s = s + dt * (sInputs - s) / tau
-    
-    if useRealTraj:
-        if s[0, watchCell] > spikeThreshold:
-            spikeCoords.append([pos[0, tind], pos[1, tind]])
-            xindex = int((pos[0, tind] - minx) / (maxx-minx) * nSpatialBins)
-            yindex = int((pos[1, tind] - miny) / (maxy-miny) * nSpatialBins)
-            occupancy[yindex, xindex] += dt
-            spikes[yindex, xindex] += s[0, watchCell]
-    
-    if tind % 40 == 0:
-        pass
